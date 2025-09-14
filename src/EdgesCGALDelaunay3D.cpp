@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <vector>
 #include <string>
 #include <fstream>
@@ -37,21 +38,114 @@ struct BBox {
     bool valid() const { return xmin <= xmax && ymin <= ymax && zmin <= zmax; }
 };
 
-static inline bool parse_xyz(const char* s, double& x, double& y, double& z) {
-    while (*s == ' ' || *s == '\t') ++s;
-    if (*s == '\0' || *s == '\n' || *s == '\r' || *s == '#') return false;
-    char* endp;
-    x = std::strtod(s, &endp); if (endp == s) return false; s = endp;
-    y = std::strtod(s, &endp); if (endp == s) return false; s = endp;
-    z = std::strtod(s, &endp); if (endp == s) return false;
+static bool load_npy_points(const char* path,
+    std::vector<std::pair<CGAL::Exact_predicates_inexact_constructions_kernel::Point_3, uint32_t>>& pts,
+    BBox& bb)
+{
+    using Point = CGAL::Exact_predicates_inexact_constructions_kernel::Point_3;
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) { std::perror("fopen(input)"); return false; }
+
+    char magic[6];
+    if (std::fread(magic,1,6,f) != 6 || std::memcmp(magic, "\x93NUMPY",6) != 0) {
+        std::fprintf(stderr, "Invalid NPY magic string.\n");
+        std::fclose(f); return false;
+    }
+    unsigned char ver[2];
+    if (std::fread(ver,1,2,f) != 2) { std::fclose(f); return false; }
+    uint32_t header_len = 0;
+    if (ver[0] == 1) {
+        uint16_t hl; if (std::fread(&hl,2,1,f) != 1) { std::fclose(f); return false; }
+        header_len = hl;
+    } else if (ver[0] == 2) {
+        uint32_t hl; if (std::fread(&hl,4,1,f) != 1) { std::fclose(f); return false; }
+        header_len = hl;
+    } else {
+        std::fprintf(stderr, "Unsupported NPY version %u.%u\n", ver[0], ver[1]);
+        std::fclose(f); return false;
+    }
+    std::string header(header_len, '\0');
+    if (std::fread(header.data(),1,header_len,f) != header_len) { std::fclose(f); return false; }
+    if (header.find("True") != std::string::npos && header.find("fortran_order") != std::string::npos) {
+        std::fprintf(stderr, "Fortran-ordered arrays not supported.\n");
+        std::fclose(f); return false;
+    }
+    // descr
+    size_t pos = header.find("'descr':");
+    if (pos == std::string::npos) { std::fclose(f); return false; }
+    size_t start = header.find("'", pos+8);
+    size_t end = header.find("'", start+1);
+    std::string descr = header.substr(start+1, end-start-1);
+    bool is_f8 = (descr == "<f8");
+    bool is_f4 = (descr == "<f4");
+    if (!is_f8 && !is_f4) {
+        std::fprintf(stderr, "Only little-endian float32/float64 supported.\n");
+        std::fclose(f); return false;
+    }
+    // shape
+    pos = header.find("'shape':");
+    if (pos == std::string::npos) { std::fclose(f); return false; }
+    start = header.find('(', pos);
+    end = header.find(')', start);
+    std::string shape = header.substr(start+1, end-start-1);
+    const char* p = shape.c_str();
+    char* q;
+    size_t npts = std::strtoull(p, &q, 10);
+    p = q;
+    while (*p == ' ' || *p == ',') ++p;
+    size_t dim = std::strtoull(p, &q, 10);
+    if (dim != 3) {
+        std::fprintf(stderr, "Input array must be of shape (N,3).\n");
+        std::fclose(f); return false;
+    }
+
+    size_t total = npts * 3;
+    pts.reserve(npts);
+    if (is_f8) {
+        std::vector<double> buf(total);
+        if (std::fread(buf.data(), sizeof(double), total, f) != total) { std::fclose(f); return false; }
+        for (size_t i = 0; i < npts; ++i) {
+            double x = buf[3*i], y = buf[3*i+1], z = buf[3*i+2];
+            if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
+                bb.update(x,y,z);
+                pts.emplace_back(Point(x,y,z), (uint32_t)pts.size());
+            }
+        }
+    } else {
+        std::vector<float> buf(total);
+        if (std::fread(buf.data(), sizeof(float), total, f) != total) { std::fclose(f); return false; }
+        for (size_t i = 0; i < npts; ++i) {
+            double x = buf[3*i], y = buf[3*i+1], z = buf[3*i+2];
+            if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
+                bb.update(x,y,z);
+                pts.emplace_back(Point(x,y,z), (uint32_t)pts.size());
+            }
+        }
+    }
+    std::fclose(f);
     return true;
+}
+
+static void write_npy_header(std::FILE* f, size_t rows) {
+    std::string header = "{'descr': '<u4', 'fortran_order': False, 'shape': (" +
+        std::to_string(rows) + ", 2), }";
+    size_t header_len = header.size() + 1; // for trailing newline
+    size_t pad = 16 - ((10 + header_len) % 16);
+    header.append(pad, ' ');
+    header.push_back('\n');
+    uint16_t hlen = (uint16_t)header.size();
+    std::fwrite("\x93NUMPY",1,6,f);
+    unsigned char ver[2] = {1,0};
+    std::fwrite(ver,1,2,f);
+    std::fwrite(&hlen,2,1,f);
+    std::fwrite(header.data(),1,header.size(),f);
 }
 
 int main(int argc, char** argv) {
     if (argc != 3) {
         std::fprintf(stderr,
-            "Usage: %s input.xyz output.edges\n"
-            "Each input line: x y z (floats)\n", argv[0]);
+            "Usage: %s input.npy output.npy\n"
+            "input: (N,3) float32/float64 array\n", argv[0]);
         return 1;
     }
     const char* in_path = argv[1];
@@ -81,47 +175,9 @@ int main(int argc, char** argv) {
     }
     #endif
 
-    std::FILE* fin = std::fopen(in_path, "rb");
-    if (!fin) { std::perror("fopen(input)"); return 2; }
-
     std::vector<std::pair<Point, uint32_t>> pts;
-    pts.reserve(1<<20);
     BBox bb;
-
-    // bulk read and parse
-    {
-        const size_t BUFSZ = size_t(1) << 20;
-        std::vector<char> buf(BUFSZ);
-        std::string acc; acc.reserve(BUFSZ);
-        while (true) {
-            size_t n = std::fread(buf.data(), 1, BUFSZ, fin);
-            if (n == 0) break;
-            for (size_t i = 0; i < n; ++i) {
-                char c = buf[i];
-                if (c == '\r') continue;
-                if (c == '\n') {
-                    double x,y,z;
-                    if (parse_xyz(acc.c_str(), x,y,z)) {
-                        if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
-                            bb.update(x,y,z);
-                            pts.emplace_back(Point(x,y,z), (uint32_t)pts.size());
-                        }
-                    }
-                    acc.clear();
-                } else acc.push_back(c);
-            }
-        }
-        if (!acc.empty()) {
-            double x,y,z;
-            if (parse_xyz(acc.c_str(), x,y,z)) {
-                if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
-                    bb.update(x,y,z);
-                    pts.emplace_back(Point(x,y,z), (uint32_t)pts.size());
-                }
-            }
-        }
-    }
-    std::fclose(fin);
+    if (!load_npy_points(in_path, pts, bb)) return 2;
 
     if (pts.size() < 2) {
         std::fprintf(stderr, "Input has < 2 valid points. Nothing to do.\n");
@@ -149,16 +205,7 @@ int main(int argc, char** argv) {
     if (!dt.is_valid(false))
         std::fprintf(stderr, "[warning] CGAL triangulation reports invalid structure.\n");
 
-    // Write edges
-    std::FILE* fout = std::fopen(out_path, "wb");
-    if (!fout) { std::perror("fopen(output)"); return 3; }
-    const size_t OUTBUFSZ = size_t(1) << 20;
-    std::vector<char> filebuf(OUTBUFSZ);
-    setvbuf(fout, filebuf.data(), _IOFBF, filebuf.size());
-
-    std::vector<char> outbuf; outbuf.reserve(OUTBUFSZ);
-    auto flush_buf = [&](){ if (!outbuf.empty()) { std::fwrite(outbuf.data(),1,outbuf.size(),fout); outbuf.clear(); } };
-
+    // Count edges
     size_t edge_count = 0;
     for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
         auto c = eit->first;
@@ -169,13 +216,24 @@ int main(int argc, char** argv) {
         uint32_t a = vi->info(), b = vj->info();
         if (a == b) continue;
         if (a > b) std::swap(a,b);
-        char line[64];
-        int len = std::snprintf(line, sizeof(line), "%u %u\n", a, b);
-        if (outbuf.size() + (size_t)len > OUTBUFSZ) flush_buf();
-        outbuf.insert(outbuf.end(), line, line + len);
         ++edge_count;
     }
-    flush_buf();
+
+    std::FILE* fout = std::fopen(out_path, "wb");
+    if (!fout) { std::perror("fopen(output)"); return 3; }
+    write_npy_header(fout, edge_count);
+    for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+        auto c = eit->first;
+        int i = eit->second, j = eit->third;
+        auto vi = c->vertex(i);
+        auto vj = c->vertex(j);
+        if (dt.is_infinite(vi) || dt.is_infinite(vj)) continue;
+        uint32_t a = vi->info(), b = vj->info();
+        if (a == b) continue;
+        if (a > b) std::swap(a,b);
+        uint32_t ab[2] = {a,b};
+        std::fwrite(ab, sizeof(uint32_t), 2, fout);
+    }
     std::fclose(fout);
     std::fprintf(stderr, "[info] Wrote %zu edges to %s\n", edge_count, out_path);
     return 0;
