@@ -5,6 +5,9 @@
 #include <CGAL/Delaunay_triangulation_cell_base_3.h>
 #include <CGAL/Triangulation_vertex_base_with_info_3.h>
 #include <CGAL/Triangulation_data_structure_3.h>
+#include <CGAL/Spatial_sort_traits_adapter_3.h>
+#include <CGAL/property_map.h>
+#include <CGAL/spatial_sort.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +27,10 @@
   #include <tbb/global_control.h>
 #endif
 
+using Kernel = CGAL::Exact_predicates_inexact_constructions_kernel;
+using Point = Kernel::Point_3;
+using Point_with_id = std::pair<Point, uint32_t>;
+
 struct BBox {
     double xmin =  std::numeric_limits<double>::infinity();
     double ymin =  std::numeric_limits<double>::infinity();
@@ -39,10 +46,9 @@ struct BBox {
 };
 
 static bool load_npy_points(const char* path,
-    std::vector<std::pair<CGAL::Exact_predicates_inexact_constructions_kernel::Point_3, uint32_t>>& pts,
+    std::vector<Point_with_id>& pts,
     BBox& bb)
 {
-    using Point = CGAL::Exact_predicates_inexact_constructions_kernel::Point_3;
     std::FILE* f = std::fopen(path, "rb");
     if (!f) { std::perror("fopen(input)"); return false; }
 
@@ -161,7 +167,6 @@ int main(int argc, char** argv) {
       using Tds = CGAL::Triangulation_data_structure_3<Vb, Cb>;
     #endif
     using Dt  = CGAL::Delaunay_triangulation_3<K, Tds>;
-    using Point = K::Point_3;
 
     #ifdef CGAL_LINKED_WITH_TBB
     {
@@ -175,7 +180,7 @@ int main(int argc, char** argv) {
     }
     #endif
 
-    std::vector<std::pair<Point, uint32_t>> pts;
+    std::vector<Point_with_id> pts;
     BBox bb;
     if (!load_npy_points(in_path, pts, bb)) return 2;
 
@@ -186,6 +191,14 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::fprintf(stderr, "[info] Loaded %zu points\n", pts.size());
+
+    CGAL::spatial_sort(
+        pts.begin(),
+        pts.end(),
+        CGAL::Spatial_sort_traits_adapter_3<
+            K,
+            CGAL::First_of_pair_property_map<Point_with_id>
+        >(K()));
 
     // Triangulation
     #ifdef CGAL_LINKED_WITH_TBB
